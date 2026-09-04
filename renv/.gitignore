@@ -1,0 +1,11 @@
+library/
+local/
+cellar/
+lock/
+python/
+sandbox/
+staging/
+renv/
+.Rprofile
+.quarto
+.log

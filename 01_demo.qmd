@@ -1,0 +1,855 @@
+---
+title: "Credit Risk Scoring: End-to-End ML with snowflakeR"
+subtitle: "Feature Store → tidymodels → Model Registry → SPCS Deployment"
+format: html
+---
+
+An end-to-end credit risk scoring workflow demonstrating how a fintech company
+can build, evaluate, and deploy credit-risk models entirely within Snowflake
+using R and the `snowflakeR` package.
+
+**What you'll do:**
+
+1. Explore lending data already in Snowflake
+2. Build reusable features in the Snowflake Feature Store
+3. Train competing models with tidymodels (logistic regression vs XGBoost)
+4. Evaluate and compare model performance
+5. Register both models in the Snowflake Model Registry with metrics
+6. Select the champion version programmatically and deploy via SPCS
+7. Score new applications via REST and SQL
+8. Verify autocapture (ML Observability)
+
+**Database layout** (created by `00_setup.qmd`):
+
+| Schema | Contents |
+|--------|----------|
+| `RAW_DATA` | Source tables — customers, payments, loans |
+| `FEATURES` | Feature Store (entity, feature views, dynamic tables) |
+| `TRAINING` | Materialised training datasets |
+| `MODELS` | Model Registry (versioned models, metrics, services) |
+
+## 1. Setup and Connect
+
+```{r}
+
+#| label: setup
+# Declare Python deps before reticulate/snowflakeR touch Python, so
+# reticulate's ephemeral venv (uv-backed) includes the Snowflake SDKs.
+reticulate::py_require(packages = c(
+  "snowflake-ml-python>=1.5.0",
+  "snowflake-snowpark-python",
+  "pandas"
+))
+library(snowflakeR)
+library(RSnowflake)
+library(tidymodels)
+#library(xgboost)
+library(ggplot2)
+library(dplyr)
+library(scales)
+library(reticulate)
+source("_config.R")
+extra_deps <- c("r-base==4.5.3", "r-xgboost", "r-ranger", "numpy<2.0")
+py_require(c("snowflake-connector-python[pandas]", "snowflake-snowpark-python", "pandas")) 
+# 1. Instantiate the working Snowpark session via Python SDK using the Workbench credentials 
+snowpark <- import("snowflake.snowpark") 
+py_session <- snowpark$Session$builder$configs(dict(connection_name = "workbench"))$create() 
+cat("tidymodels", as.character(packageVersion("tidymodels")), "loaded\n")
+cat("xgboost", as.character(packageVersion("xgboost")), "loaded\n")
+```
+
+### Connect and Configure Database Context
+
+```{r}
+#| label: connect# 1. Instantiate the working Snowpark session via Python SDK using the Workbench credentials 
+
+# 2. Set active database, schema, and warehouse on the Python session 
+# (This populates the session context so snowflakeR's active session check doesn't evaluate to NA) 
+py_session$sql("USE WAREHOUSE DEFAULT_WH")$collect() 
+py_session$sql("USE DATABASE CREDIT_RISK_ML")$collect() 
+py_session$sql("USE SCHEMA MODELS")$collect() 
+
+#snowflakeR connection
+conn<-sfr_connect()
+
+tbl_customers <- fqn_source("CREDIT_CUSTOMERS")
+tbl_payments  <- fqn_source("CREDIT_PAYMENTS")
+tbl_loans     <- fqn_source("CREDIT_LOANS")
+
+#n <- sfr_query(conn, paste("SELECT COUNT(*) AS n FROM", tbl_loans))
+#cat(sprintf("Connected. Loan applications: %s\n", format(n$N, big.mark = ",")))
+```
+
+### Model Registry
+
+```{r}
+#| label: registry
+reg <- sfr_model_registry(conn,
+  database = CR_DATABASE,
+  schema   = CR_REGISTRY_SCHEMA
+)
+cat(sprintf("Model Registry: %s.%s\n", CR_DATABASE, CR_REGISTRY_SCHEMA))
+```
+
+## 2. Feature Store
+
+Define reusable features in the **FEATURES** schema using `dplyr`/`dbplyr`
+pipelines. Each Feature View is backed by a Snowflake Dynamic Table that
+refreshes automatically.
+
+Features defined here are used identically in training and production scoring —
+**define once, use everywhere**.
+
+```{r}
+
+#| label: feature-store-init
+fs <- sfr_feature_store(conn,
+  database  = CR_DATABASE,
+  schema    = CR_FEATURE_SCHEMA,
+  warehouse = conn$warehouse,
+  create    = TRUE
+)
+dbi_con <- DBI::dbConnect(
+  odbc::snowflake(),
+  warehouse = conn$warehouse,
+  database  = CR_DATABASE,
+  schema    = CR_FEATURE_SCHEMA
+)
+
+
+tbl_customers <- fqn_source("CREDIT_CUSTOMERS")
+tbl_payments  <- fqn_source("CREDIT_PAYMENTS")
+tbl_loans     <- fqn_source("CREDIT_LOANS")
+
+
+customers_tbl <- tbl(dbi_con, I(tbl_customers))
+payments_tbl  <- tbl(dbi_con, I(tbl_payments))
+loans_tbl     <- tbl(dbi_con, I(tbl_loans))
+# Assuming 'session' is your active snowpark Session object
+# cat("Feature Store and dbplyr table references ready.\n")
+# fs
+```
+
+### Create Entity
+
+```{r}
+#| label: entity
+customer_entity <- sfr_create_entity(
+  fs, "CUSTOMER", "CUSTOMER_ID",
+  desc = "Loan applicant"
+)
+customer_entity
+```
+
+### Feature View 1: Customer Profile
+
+Static demographic features. We build the feature query as a `dbplyr` pipeline,
+render to SQL with `dbplyr::sql_render()`, and pass that SQL string to
+`sfr_create_feature_view()`.
+
+```{r}
+#| label: fv-profile
+profile_query <- customers_tbl |>
+  select(CUSTOMER_ID, AGE, ANNUAL_INCOME, EMPLOYMENT_LENGTH_YEARS,
+         HOME_OWNERSHIP) |>
+  mutate(LOG_INCOME = log(pmax(ANNUAL_INCOME, 1)))
+
+profile_sql <- dbplyr::sql_render(profile_query)
+cat("dbplyr pipeline rendered to SQL:\n")
+cat(as.character(profile_sql), "\n")
+```
+
+```{r}
+#| label: fv-profile-register
+fv_profile <- sfr_create_feature_view(
+  fs,
+  name      = "CUSTOMER_PROFILE_FV",
+  version   = "v1",
+  entities  = customer_entity,
+  feature_df  = profile_sql,
+  desc      = "Customer demographic profile features",
+  overwrite = TRUE
+)
+cat("Registered CUSTOMER_PROFILE_FV (using SQL string)\n")
+```
+
+### Feature View 2: Payment Behaviour (Dynamic Table)
+
+Aggregated payment history — captures delinquency patterns. Passes the
+`dbplyr` lazy table directly (contrast with the SQL string approach above).
+
+Uses `refresh_freq` to create a **Dynamic Table** that Snowflake refreshes
+automatically — use this when source data changes frequently.
+
+```{r}
+#| label: fv-payments
+payment_query <- payments_tbl |>
+  group_by(CUSTOMER_ID) |>
+  summarise(
+    AVG_DAYS_PAST_DUE  = mean(DAYS_PAST_DUE, na.rm = TRUE),
+    MAX_DAYS_PAST_DUE  = max(DAYS_PAST_DUE, na.rm = TRUE),
+    PCT_MISSED         = sum(ifelse(PAYMENT_STATUS == "MISSED", 1, 0),
+                             na.rm = TRUE) / n(),
+    PCT_ON_TIME        = sum(ifelse(PAYMENT_STATUS == "ON_TIME", 1, 0),
+                             na.rm = TRUE) / n(),
+    AVG_PAYMENT_AMOUNT = mean(PAYMENT_AMOUNT, na.rm = TRUE),
+    TOTAL_PAYMENTS     = n(),
+    .groups = "drop"
+  )
+
+fv_payments <- sfr_create_feature_view(
+  fs,
+  name         = "PAYMENT_BEHAVIOR_FV",
+  version      = "v1",
+  entities     = customer_entity,
+  feature_df   = payment_query,
+  refresh_freq = "1 hour",
+  desc         = "Payment behaviour aggregates (dynamic table)",
+  overwrite    = TRUE
+)
+cat("Registered PAYMENT_BEHAVIOR_FV (dynamic table, 1h refresh)\n")
+```
+
+### Feature View 3: Credit History
+
+Aggregated lending history. Also passes the `dbplyr` lazy table directly.
+
+```{r}
+#| label: fv-credit
+credit_query <- loans_tbl |>
+  group_by(CUSTOMER_ID) |>
+  summarise(
+    TOTAL_APPLICATIONS = n(),
+    AVG_LOAN_AMOUNT    = mean(LOAN_AMOUNT, na.rm = TRUE),
+    MAX_LOAN_AMOUNT    = max(LOAN_AMOUNT, na.rm = TRUE),
+    PRIOR_DEFAULTS     = sum(DEFAULTED, na.rm = TRUE),
+    AVG_INTEREST_RATE  = mean(INTEREST_RATE, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+fv_credit <- sfr_create_feature_view(
+  fs,
+  name      = "CREDIT_HISTORY_FV",
+  version   = "v1",
+  entities  = customer_entity,
+  feature_df  = credit_query,
+  desc      = "Credit / lending history aggregates",
+  overwrite = TRUE
+)
+cat("Registered CREDIT_HISTORY_FV\n")
+```
+
+```{r}
+#| label: list-fvs
+cat("Feature Views registered:\n")
+sfr_list_feature_views(fs)
+```
+
+## 3. Exploratory Data Analysis
+
+```{r}
+#| label: eda-data
+eda_query <- loans_tbl |>
+  left_join(
+    customers_tbl |>
+      select(CUSTOMER_ID, AGE, ANNUAL_INCOME,
+             EMPLOYMENT_LENGTH_YEARS, HOME_OWNERSHIP),
+    by = "CUSTOMER_ID"
+  )
+
+loans_df <- collect(eda_query)
+loans_df$DEFAULTED <- factor(loans_df$DEFAULTED, levels = c(0, 1),
+                             labels = c("No Default", "Default"))
+cat(sprintf("Joined dataset: %d rows x %d cols\n", nrow(loans_df), ncol(loans_df)))
+```
+
+### Default Rate Overview
+
+```{r}
+#| label: fig-default-dist
+#| fig-cap: "Loan default distribution (~15% default rate)"
+ggplot(loans_df, aes(x = DEFAULTED, fill = DEFAULTED)) +
+  geom_bar(show.legend = FALSE) +
+  geom_text(stat = "count", aes(label = comma(after_stat(count))),
+            vjust = -0.5, size = 4) +
+  scale_fill_manual(values = c("#2ecc71", "#e74c3c")) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.1))) +
+  labs(title = "Loan Default Distribution",
+       subtitle = "~15% default rate -- realistic class imbalance",
+       x = NULL, y = "Applications") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+### Income vs Default
+
+```{r}
+#| label: fig-income
+#| fig-cap: "Lower income correlates with higher default probability"
+ggplot(loans_df, aes(x = ANNUAL_INCOME, fill = DEFAULTED)) +
+  geom_density(alpha = 0.5) +
+  scale_x_continuous(labels = dollar) +
+  coord_cartesian(xlim = c(0, 250000)) +
+  scale_fill_manual(values = c("#2ecc71", "#e74c3c")) +
+  labs(title = "Income Distribution by Default Status",
+       x = "Annual Income", y = "Density", fill = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "top")
+```
+
+### Employment Length vs Default Rate
+
+```{r}
+#| label: fig-employment
+#| fig-cap: "Longer employment correlates with lower default rate"
+emp_summary <- loans_df |>
+  mutate(emp_bin = cut(EMPLOYMENT_LENGTH_YEARS,
+                       breaks = c(-1, 2, 5, 10, 20, 50),
+                       labels = c("0-2yr", "3-5yr", "6-10yr",
+                                  "11-20yr", "20+yr"))) |>
+  group_by(emp_bin) |>
+  summarise(default_rate = mean(DEFAULTED == "Default"),
+            n = n(), .groups = "drop")
+
+ggplot(emp_summary, aes(x = emp_bin, y = default_rate)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = sprintf("%.0f%%", default_rate * 100)),
+            vjust = -0.5, size = 4) +
+  scale_y_continuous(labels = percent, expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Default Rate by Employment Length",
+       x = "Employment Length", y = "Default Rate") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+## 4. Generate Training Data from Feature Store
+
+Join the label spine (loan applications with default outcome) with all three
+Feature Views. The Feature Store handles the joins automatically — the same
+features used here will be retrieved at inference time.
+
+```{r}
+#| label: training-data
+training_data <- sfr_generate_training_data(
+  fs,
+  spine = paste(
+    "SELECT application_id, customer_id, defaulted",
+    "FROM", tbl_loans
+  ),
+  features = list(fv_profile, fv_payments, fv_credit),
+  spine_label_cols = "DEFAULTED"
+)
+
+tbl_training <- fqn_training("CREDIT_RISK_TRAINING")
+sfr_write_table(conn, tbl_training, training_data, overwrite = TRUE)
+
+cat(sprintf("Training data: %d rows x %d cols -> %s\n",
+            nrow(training_data), ncol(training_data), tbl_training))
+head(as.data.frame(training_data), 5)
+```
+
+```{r}
+#| label: prep-labels
+training_data$DEFAULTED <- factor(training_data$DEFAULTED,
+                                  levels = c(1, 0),
+                                  labels = c("yes", "no"))
+
+cat("Label distribution:\n")
+table(training_data$DEFAULTED)
+```
+
+## 5. Model Training with tidymodels
+
+Two models compared with cross-validation:
+
+- **Logistic Regression** — interpretable baseline, standard in credit risk
+- **XGBoost** — gradient-boosted trees, typically better predictive performance
+
+### Preprocessing Recipe
+
+```{r}
+#| label: recipe
+credit_recipe <- recipe(
+  DEFAULTED ~ AGE + ANNUAL_INCOME + LOG_INCOME +
+    EMPLOYMENT_LENGTH_YEARS + HOME_OWNERSHIP +
+    AVG_DAYS_PAST_DUE + MAX_DAYS_PAST_DUE +
+    PCT_MISSED + PCT_ON_TIME + AVG_PAYMENT_AMOUNT +
+    TOTAL_PAYMENTS + TOTAL_APPLICATIONS + AVG_LOAN_AMOUNT +
+    MAX_LOAN_AMOUNT + PRIOR_DEFAULTS + AVG_INTEREST_RATE,
+  data = training_data
+) |>
+  step_dummy(HOME_OWNERSHIP) |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_zv(all_predictors()) |>
+  step_normalize(all_numeric_predictors())
+
+credit_recipe
+```
+
+### Define Model Specifications
+
+```{r}
+#| label: specs
+logistic_spec <- logistic_reg() |>
+  set_engine("glm") |>
+  set_mode("classification")
+
+xgb_spec <- boost_tree(
+  trees = 500,
+  tree_depth = 6,
+  learn_rate = 0.05,
+  min_n = 10
+) |>
+  set_engine("xgboost") |>
+  set_mode("classification")
+
+cat("Model specifications defined\n")
+```
+
+### Create Workflows
+
+```{r}
+#| label: workflows
+wf_logistic <- workflow() |>
+  add_recipe(credit_recipe) |>
+  add_model(logistic_spec)
+
+wf_xgb <- workflow() |>
+  add_recipe(credit_recipe) |>
+  add_model(xgb_spec)
+
+cat("Workflows created\n")
+```
+
+### Cross-Validated Evaluation
+
+5-fold stratified CV for honest performance estimates.
+
+```{r}
+#| label: cv
+set.seed(42)
+folds <- vfold_cv(training_data, v = 5, strata = DEFAULTED)
+credit_metrics <- metric_set(roc_auc, accuracy, pr_auc)
+
+cat("Evaluating logistic regression (5-fold CV)...\n")
+results_lr <- fit_resamples(wf_logistic, folds, metrics = credit_metrics)
+
+cat("Evaluating XGBoost (5-fold CV)...\n")
+results_xgb <- fit_resamples(wf_xgb, folds, metrics = credit_metrics)
+
+cat("Cross-validation complete\n")
+```
+
+## 6. Model Evaluation
+
+### Compare CV Metrics
+
+```{r}
+#| label: cv-comparison
+metrics_lr  <- collect_metrics(results_lr) |> mutate(model = "Logistic Regression")
+metrics_xgb <- collect_metrics(results_xgb) |> mutate(model = "XGBoost")
+
+comparison <- bind_rows(metrics_lr, metrics_xgb) |>
+  select(model, .metric, mean, std_err) |>
+  arrange(.metric, desc(mean))
+
+as.data.frame(comparison)
+```
+
+```{r}
+#| label: fig-cv-compare
+#| fig-cap: "Model comparison: 5-fold cross-validation"
+ggplot(comparison, aes(x = .metric, y = mean, fill = model)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+  geom_errorbar(aes(ymin = mean - std_err, ymax = mean + std_err),
+                position = position_dodge(width = 0.7), width = 0.2) +
+  geom_text(aes(label = sprintf("%.3f", mean)),
+            position = position_dodge(width = 0.7), vjust = -0.8, size = 3.5) +
+  scale_fill_manual(values = c("#3498db", "#e67e22")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Model Comparison: 5-Fold Cross-Validation",
+       x = "Metric", y = "Mean Score", fill = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "top")
+```
+
+### Train Final Models and ROC Curves
+
+Fit both models on the full training set and compare ROC curves on a holdout.
+
+```{r}
+#| label: final-fit
+set.seed(42)
+split <- initial_split(training_data, prop = 0.8, strata = DEFAULTED)
+train_set <- training(split)
+test_set  <- testing(split)
+
+fit_lr  <- fit(wf_logistic, data = train_set)
+fit_xgb <- fit(wf_xgb, data = train_set)
+
+preds_lr  <- augment(fit_lr, test_set)
+preds_xgb <- augment(fit_xgb, test_set)
+
+roc_lr  <- roc_curve(preds_lr, DEFAULTED, .pred_yes) |> mutate(model = "Logistic")
+roc_xgb <- roc_curve(preds_xgb, DEFAULTED, .pred_yes) |> mutate(model = "XGBoost")
+
+holdout_lr <- bind_rows(
+  roc_auc(preds_lr, DEFAULTED, .pred_yes),
+  pr_auc(preds_lr, DEFAULTED, .pred_yes),
+  accuracy(preds_lr, DEFAULTED, .pred_class)
+) |> mutate(model = "Logistic Regression")
+
+holdout_xgb <- bind_rows(
+  roc_auc(preds_xgb, DEFAULTED, .pred_yes),
+  pr_auc(preds_xgb, DEFAULTED, .pred_yes),
+  accuracy(preds_xgb, DEFAULTED, .pred_class)
+) |> mutate(model = "XGBoost")
+
+cat("Holdout metrics:\n")
+bind_rows(holdout_lr, holdout_xgb) |>
+  select(model, .metric, .estimate) |>
+  as.data.frame()
+```
+
+```{r}
+#| label: fig-roc
+#| fig-cap: "ROC curves: Logistic Regression vs XGBoost"
+roc_data <- bind_rows(roc_lr, roc_xgb)
+
+auc_lr  <- roc_auc(preds_lr, DEFAULTED, .pred_yes)$.estimate
+auc_xgb <- roc_auc(preds_xgb, DEFAULTED, .pred_yes)$.estimate
+
+ggplot(roc_data, aes(x = 1 - specificity, y = sensitivity, color = model)) +
+  geom_line(linewidth = 1.1) +
+  geom_abline(linetype = "dashed", color = "grey50") +
+  scale_color_manual(values = c("#3498db", "#e67e22"),
+    labels = c(sprintf("Logistic (AUC=%.3f)", auc_lr),
+               sprintf("XGBoost (AUC=%.3f)", auc_xgb))) +
+  labs(title = "ROC Curves: Logistic Regression vs XGBoost",
+       x = "False Positive Rate", y = "True Positive Rate", color = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = c(0.7, 0.25))
+```
+
+### Select Best Model Locally
+
+```{r}
+#| label: best-model
+if (auc_xgb >= auc_lr) {
+  best_fit  <- fit_xgb
+  best_name <- "XGBoost"
+  best_auc  <- auc_xgb
+} else {
+  best_fit  <- fit_lr
+  best_name <- "Logistic Regression"
+  best_auc  <- auc_lr
+}
+cat(sprintf("Best model: %s (AUC = %.3f)\n", best_name, best_auc))
+```
+
+## 7. Register Models and Select Champion
+
+Register **both** candidate models as versions of `CREDIT_RISK_SCORER` in
+the Model Registry, attach holdout metrics, then programmatically select the
+champion based on registry-stored metrics.
+
+The registry is the single source of truth for model governance — not local
+R variables.
+
+```{r}
+#| label: verify-local
+sfr_predict_local(best_fit, test_set[1:5, ])
+```
+
+```{r}
+#| label: register-models
+input_cols <- sfr_input_cols(
+  training_data,
+  exclude = c("DEFAULTED", "CUSTOMER_ID", "APPLICATION_ID")
+)
+cat(sprintf("Inferred %d input columns from training data\n", length(input_cols)))
+
+extra_deps <- c("r-xgboost", "r-ranger", "numpy<2.0")
+
+mv_lr <- sfr_log_model(
+  reg,
+  model        = fit_lr,
+  model_name   = "CREDIT_RISK_SCORER",
+  predict_pkgs = c("tidymodels"),
+  input_cols   = input_cols,
+  output_cols  = list(prediction = "string"),
+  conda_deps   = extra_deps,
+  comment      = sprintf("Logistic regression -- AUC %.3f", auc_lr)
+)
+
+mv_xgb <- sfr_log_model(
+  reg,
+  model        = fit_xgb,
+  model_name   = "CREDIT_RISK_SCORER",
+  predict_pkgs = c("tidymodels", "xgboost"),
+  input_cols   = input_cols,
+  output_cols  = list(prediction = "string"),
+  conda_deps   = extra_deps,
+  comment      = sprintf("XGBoost -- AUC %.3f", auc_xgb)
+)
+
+cat("Both models registered\n")
+```
+
+### Attach Metrics
+
+```{r}
+#| label: attach-metrics
+for (ver in list(list(mv = mv_lr,  h = holdout_lr),
+                 list(mv = mv_xgb, h = holdout_xgb))) {
+  for (i in seq_len(nrow(ver$h))) {
+    sfr_set_model_metric(reg, "CREDIT_RISK_SCORER",
+                         ver$mv$version_name,
+                         ver$h$.metric[i], ver$h$.estimate[i])
+  }
+  cat(sprintf("  %s: attached %d metrics\n",
+              ver$mv$version_name, nrow(ver$h)))
+}
+cat("All metrics stored in Model Registry\n")
+```
+
+### Compare Versions from Registry
+
+```{r}
+#| label: registry-compare
+versions <- sfr_show_model_versions(reg, "CREDIT_RISK_SCORER")
+
+metrics_list <- Filter(Negate(is.null), lapply(versions$name, function(vn) {
+  m <- sfr_show_model_metrics(reg, "CREDIT_RISK_SCORER", vn)
+  if (length(m) == 0 || is.null(m$roc_auc)) return(NULL)
+  data.frame(version = vn,
+             roc_auc  = as.numeric(m$roc_auc),
+             pr_auc   = as.numeric(m$pr_auc),
+             accuracy = as.numeric(m$accuracy))
+}))
+
+registry_comparison <- do.call(rbind, metrics_list)
+cat("Model versions and metrics from registry:\n")
+registry_comparison
+```
+
+### Select Champion Version
+
+Pick the version with the highest `roc_auc` and set it as the model's
+default version — the version downstream consumers use automatically.
+
+```{r}
+#| label: set-champion
+champion_idx <- which.max(registry_comparison$roc_auc)
+champion_ver <- registry_comparison$version[champion_idx]
+
+sfr_set_default_model_version(reg, "CREDIT_RISK_SCORER", champion_ver)
+
+cat(sprintf("Champion: %s (roc_auc = %.3f, pr_auc = %.3f, accuracy = %.3f)\n",
+            champion_ver,
+            registry_comparison$roc_auc[champion_idx],
+            registry_comparison$pr_auc[champion_idx],
+            registry_comparison$accuracy[champion_idx]))
+cat("Set as default version in Model Registry\n")
+```
+
+## 8. Deploy Champion and Inference
+
+Deploy the champion as a scalable REST service via Snowpark Container Services
+with **autocapture** enabled. Autocapture logs every inference request/response
+to the model's inference table automatically.
+
+```{r}
+#| label: deploy
+#| eval: false
+sfr_create_compute_pool(conn, "CREDIT_POOL",
+                        instance_family = "CPU_X64_M")
+sfr_create_image_repo(conn, fqn_model("CREDIT_IMAGES"))
+
+svc_fqn <- paste(CR_DATABASE, CR_REGISTRY_SCHEMA, "CREDIT_RISK_SVC_2", sep = ".")
+sfr_execute(conn, paste("DROP SERVICE IF EXISTS", svc_fqn))
+```
+```{r}
+sfr_deploy_model(
+  reg,
+  model_name   = "CREDIT_RISK_SCORER",
+  version_name = champion_ver,
+  service_name = "credit_risk_svc_2",
+  compute_pool = "CREDIT_POOL",
+  image_repo   = fqn_model("CREDIT_IMAGES"),
+  force        = TRUE,
+  autocapture  = TRUE
+)
+```
+
+```{r}
+#| label: wait-service
+#| eval: false
+sfr_wait_for_service(reg, "credit_risk_svc_2",
+                     timeout_min = 10, poll_sec = 15)
+```
+
+### Score New Applications
+
+Retrieve features from the Feature Store for a batch of customers and score
+them through the deployed model.
+
+```{r}
+#| label: score-rest
+#| #| eval: false
+scoring_features <- sfr_retrieve_features(
+  fs,
+  spine = paste(
+    "SELECT DISTINCT customer_id FROM", tbl_customers,
+    "LIMIT 20"
+  ),
+  features = list(fv_profile, fv_payments, fv_credit)
+)
+
+cat(sprintf("Retrieved %d rows x %d cols from Feature Store\n",
+            nrow(scoring_features), ncol(scoring_features)))
+```
+
+```{r}
+#| label: predict-rest
+#| eval: false
+predictions <- sfr_predict(
+  reg, "CREDIT_RISK_SCORER",
+  scoring_features[, names(input_cols)],
+  version_name = champion_ver,
+  service_name = "credit_risk_svc"
+)
+
+results <- cbind(
+  scoring_features[, "CUSTOMER_ID", drop = FALSE],
+  predictions
+)
+cat("Predictions for 20 customers:\n")
+results
+```
+
+### Score from SQL
+
+The SPCS service exposes a `PREDICT` function callable directly from SQL —
+accessible to any Snowflake user, BI tool, or scheduled task without R/Python.
+
+```{r}
+#| label: predict-sql
+#| eval: false
+svc_fn   <- paste(CR_DATABASE, CR_REGISTRY_SCHEMA,
+                  "CREDIT_RISK_SVC!PREDICT", sep = ".")
+col_list <- paste(names(input_cols), collapse = ", ")
+
+sql_score <- paste(
+  "SELECT *,", svc_fn, "(", col_list, ") AS prediction",
+  "FROM", fqn_training("CREDIT_RISK_TRAINING"),
+  "LIMIT 10"
+)
+
+cat("SQL prediction query:\n")
+cat(sql_score, "\n\n")
+sfr_query(conn, sql_score)
+```
+
+### Verify Autocapture
+
+Every inference request was logged to the model's inference table (ML
+Observability). This feeds drift detection, performance tracking, and
+monitoring.
+
+```{r}
+#| label: autocapture
+#| eval: false
+model_fqn <- paste(CR_DATABASE, CR_REGISTRY_SCHEMA,
+                   "SFR_CREDIT_RISK_SCORER", sep = ".")
+
+row_count <- 0L
+for (attempt in 1:12) {
+  row_count <- sfr_query(
+    conn,
+    sprintf("SELECT COUNT(*) AS N FROM TABLE(INFERENCE_TABLE('%s'))", model_fqn)
+  )$N[1]
+  if (!is.na(row_count) && row_count > 0) break
+  Sys.sleep(5)
+}
+
+cat(sprintf("Autocapture rows captured: %d\n", row_count))
+stopifnot(
+  "No autocapture rows found after 60s" = row_count > 0
+)
+```
+
+```{r}
+#| label: autocapture-detail
+#| eval: false
+detail_sql <- sprintf("
+SELECT
+    TIMESTAMP,
+    RESOURCE_ATTRIBUTES:\"snow.model.version.name\"::STRING AS MODEL_VERSION,
+    RECORD_ATTRIBUTES:\"snow.model_serving.function.name\"::STRING AS FUNCTION_NAME,
+    RECORD_ATTRIBUTES:\"snow.model_serving.response.code\"::INT AS RESPONSE_CODE
+FROM TABLE(INFERENCE_TABLE('%s'))
+ORDER BY TIMESTAMP DESC
+LIMIT 10
+", model_fqn)
+
+cat("Recent autocapture entries:\n")
+sfr_query(conn, detail_sql)
+```
+
+## 9. Optional: SQL Pushdown with orbital
+
+If the `orbital` package is installed, the trained tidymodels workflow can be
+converted to pure SQL — useful for batch scoring without deploying an SPCS
+service.
+
+```{r}
+#| label: orbital
+#| eval: false
+# pak::pak("tidymodels/orbital")
+# library(orbital)
+# sql_model <- orbital(fit_xgb)
+# predict(sql_model, con = dbi_con, table = tbl_training)
+```
+
+## 10. Cleanup (Optional)
+
+```{r}
+#| label: cleanup
+#| eval: false
+# Drop SPCS services before deleting the model
+# sfr_execute(conn, paste("DROP SERVICE IF EXISTS", svc_fqn))
+# sfr_execute(conn, paste("DROP COMPUTE POOL IF EXISTS R_CREDIT_POOL"))
+
+# Drop model
+# sfr_execute(conn, paste(
+#   "DROP MODEL IF EXISTS",
+#   paste(CR_DATABASE, CR_REGISTRY_SCHEMA, "SFR_CREDIT_RISK_SCORER", sep = ".")
+# ))
+
+# Full teardown (careful!)
+# sfr_execute(conn, paste("DROP DATABASE IF EXISTS", CR_DATABASE))
+```
+
+## Summary
+
+| Schema | What we did |
+|--------|-------------|
+| `RAW_DATA` | Queried source lending data |
+| `FEATURES` | Created entity + 3 Feature Views (1 Dynamic Table) |
+| `TRAINING` | Generated training data from Feature Store joins |
+| `MODELS` | Registered both models, compared metrics, deployed champion |
+
+### Key Advantages Over Traditional Workflow
+
+| Traditional (RStudio + Plumber) | Snowflake (snowflakeR + SPCS) |
+|---------------------------------|-------------------------------|
+| Data exported to local machine | Data stays in Snowflake |
+| Manual feature engineering scripts | Feature Store: define once, use everywhere |
+| Model files on shared drives | Model Registry: versioned, governed, with metrics |
+| Plumber API on a VM | SPCS: auto-scaled containers, no infra management |
+| No inference logging | Autocapture: every prediction logged automatically |
+| Manual model comparison | Registry metrics: programmatic champion selection |

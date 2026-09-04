@@ -1,0 +1,308 @@
+---
+title: "Credit Risk Demo: Environment & Data Setup"
+format: html
+execute:
+  warning: false
+  message: false
+---
+
+**Run this document once** before the credit risk demo to prepare the
+environment, create the database layout, and generate synthetic lending data.
+
+After this document completes, the demo (`workspace_credit_risk_demo.qmd`)
+runs from Section 1 with no setup delays.
+
+**What this document does:**
+
+1. Load R packages: tidymodels, XGBoost, ranger
+2. Connect to Snowflake via DBI/odbc
+3. Create a dedicated database with isolated schemas for source data,
+   Feature Store, training artefacts, and model registry
+4. Generate three synthetic lending tables (~50K loans, 10K customers, ~500K payments)
+5. Validate everything is ready
+
+## 1. Setup
+
+::: {.callout-note}
+In Positron, the R environment and packages are managed by your local R
+installation. Install any missing packages with `pak::pkg_install()` or
+`install.packages()` before running this document.
+:::
+
+Load packages and verify versions:
+
+```{r}
+#| label: load-libraries
+library(DBI)
+library(odbc)
+library(yaml)
+library(tidymodels)
+library(xgboost)
+library(ggplot2)
+library(dplyr)
+library(scales)
+cat("tidymodels", as.character(packageVersion("tidymodels")), "loaded\n")
+cat("xgboost",   as.character(packageVersion("xgboost")),   "loaded\n")
+```
+
+## 3. Connect and Create Database Layout
+
+Connect to Snowflake and configure the database layout. Create four isolated
+schemas:
+
+| Schema | Purpose |
+|---|---|
+| `RAW_DATA` | Synthetic source tables (customers, payments, loans) |
+| `FEATURES` | Feature Store (entity, feature views, dynamic tables) |
+| `TRAINING` | Materialised training datasets |
+| `MODELS` | Model Registry (versioned models, metrics) |
+
+```{r}
+#| label: connect
+conn <- DBI::dbConnect(
+  odbc::snowflake(),
+  Database  = "CREDIT_RISK_ML",
+  Schema    = "PUBLIC",
+  Warehouse = "DEFAULT_WH"
+)
+conn
+```
+
+```{r}
+#| label: config
+# Read schema names from config file; fall back to defaults if not present
+# cfg <- tryCatch(
+#   yaml::read_yaml("snowflaker_credit_risk_config.yaml")$credit_risk,
+#   error = function(e) list()
+# )
+cfg <- list(
+  database             = Sys.getenv("CR_DB",'CREDIT_RISK_ML'),
+  source_schema        = Sys.getenv("CR_SOURCE_SCHEMA",'RAW_DATA'),
+  feature_store_schema = Sys.getenv("CR_FEATURE_STORE_SCHEMA",'FEATURES'),
+  training_schema      = Sys.getenv("CR_TRAINING_SCHEMA",'TRAINING'),
+  registry_schema      = Sys.getenv("CR_REGISTRY_SCHEMA",'MODELS')
+)
+cr_db       <- cfg$database             %||% "CREDIT_RISK_ML"
+cr_source   <- cfg$source_schema        %||% "RAW_DATA"
+cr_features <- cfg$feature_store_schema %||% "FEATURES"
+cr_training <- cfg$training_schema      %||% "TRAINING"
+cr_registry <- cfg$registry_schema      %||% "MODELS"
+
+fqn_source  <- function(name) paste(cr_db, cr_source,   name, sep = ".")
+fqn_feature <- function(name) paste(cr_db, cr_features, name, sep = ".")
+fqn_model   <- function(name) paste(cr_db, cr_registry, name, sep = ".")
+
+cat("Database layout:\n")
+cat(sprintf("  Database:       %s\n", cr_db))
+cat(sprintf("  Source data:    %s.%s\n", cr_db, cr_source))
+cat(sprintf("  Feature Store:  %s.%s\n", cr_db, cr_features))
+cat(sprintf("  Training:       %s.%s\n", cr_db, cr_training))
+cat(sprintf("  Model Registry: %s.%s\n", cr_db, cr_registry))
+```
+
+### Create Database and Schemas
+
+```{r}
+#| label: create-db
+DBI::dbExecute(conn, paste("CREATE DATABASE IF NOT EXISTS", cr_db))
+
+for (schema in c(cr_source, cr_features, cr_training, cr_registry)) {
+  DBI::dbExecute(conn, paste(
+    "CREATE SCHEMA IF NOT EXISTS", paste(cr_db, schema, sep = ".")
+  ))
+}
+
+cat(sprintf("Database %s ready with 4 schemas.\n", cr_db))
+```
+
+## 4. Generate Synthetic Data
+
+Three tables simulate a lending platform's data warehouse.
+All data is generated in Snowflake using SQL — no external files needed.
+
+- **CREDIT_CUSTOMERS** — 10K customers with income, employment, housing
+- **CREDIT_PAYMENTS** — ~200K payment records with delinquency info
+- **CREDIT_LOANS** — ~50K applications with a ~15% default rate
+
+The default probability is correlated with income, employment length, and
+payment behaviour so our models have real signal to learn.
+
+```{r}
+#| label: table-names
+tbl_customers <- fqn_source("CREDIT_CUSTOMERS")
+tbl_payments  <- fqn_source("CREDIT_PAYMENTS")
+tbl_loans     <- fqn_source("CREDIT_LOANS")
+
+cat("Tables will be created as:\n")
+cat(" ", tbl_customers, "\n")
+cat(" ", tbl_payments,  "\n")
+cat(" ", tbl_loans,     "\n")
+```
+
+### Customer Demographics
+
+```{r}
+#| label: create-customers
+DBI::dbExecute(conn, paste(
+  "CREATE OR REPLACE TABLE", tbl_customers, "AS",
+  "SELECT",
+  "  ROW_NUMBER() OVER (ORDER BY SEQ4()) AS customer_id,",
+  "  GREATEST(21, LEAST(75, 18 + UNIFORM(0, 57, RANDOM()))) AS age,",
+  "  GREATEST(15000,",
+  "    ROUND(UNIFORM(20000, 200000, RANDOM()), -2)) AS annual_income,",
+  "  GREATEST(0, LEAST(40,",
+  "    ROUND(UNIFORM(0, 300, RANDOM()) / 10.0, 1))) AS employment_length_years,",
+  "  ARRAY_CONSTRUCT('RENT','OWN','MORTGAGE')[",
+  "    UNIFORM(0, 2, RANDOM())] :: STRING AS home_ownership,",
+  "  ARRAY_CONSTRUCT(",
+  "    'CA','TX','NY','FL','IL','PA','OH','GA','NC','MI',",
+  "    'NJ','VA','WA','AZ','MA','CO','TN','MD','MN','IN')[",
+  "    UNIFORM(0, 19, RANDOM())] :: STRING AS state",
+  "FROM TABLE(GENERATOR(ROWCOUNT => 10000))"
+))
+cat(sprintf("Created %s\n", tbl_customers))
+DBI::dbGetQuery(conn, paste("SELECT COUNT(*) AS N FROM", tbl_customers))
+```
+
+### Payment History
+
+```{r}
+#| label: create-payments
+DBI::dbExecute(conn, paste(
+  "CREATE OR REPLACE TABLE", tbl_payments, "AS",
+  "WITH row_gen AS (",
+  "  SELECT MOD(SEQ4(), 10000) + 1 AS customer_id",
+  "  FROM TABLE(GENERATOR(ROWCOUNT => 200000))",
+  "),",
+  "payment_base AS (",
+  "  SELECT",
+  "    r.customer_id,",
+  "    DATEADD('day', -UNIFORM(1, 1095, RANDOM()),",
+  "      CURRENT_DATE()) AS payment_date,",
+  "    GREATEST(50, ROUND(",
+  "      c.annual_income / 12 * 0.15",
+  "      + UNIFORM(-400, 400, RANDOM()), 2)) AS payment_amount,",
+  "    CASE",
+  "      WHEN UNIFORM(0, 100, RANDOM()) <",
+  "        GREATEST(5, 40 - c.employment_length_years * 2",
+  "          - c.annual_income / 20000)",
+  "      THEN UNIFORM(1, 60, RANDOM())",
+  "      ELSE 0",
+  "    END AS days_past_due",
+  "  FROM row_gen r",
+  "  JOIN", tbl_customers, "c ON r.customer_id = c.customer_id",
+  ")",
+  "SELECT",
+  "  customer_id, payment_date, payment_amount, days_past_due,",
+  "  CASE",
+  "    WHEN days_past_due = 0 THEN 'ON_TIME'",
+  "    WHEN days_past_due <= 30 THEN 'LATE'",
+  "    ELSE 'MISSED'",
+  "  END AS payment_status",
+  "FROM payment_base"
+))
+cat(sprintf("Created %s\n", tbl_payments))
+DBI::dbGetQuery(conn, paste("SELECT COUNT(*) AS N FROM", tbl_payments))
+```
+
+### Loan Applications
+
+```{r}
+#| label: create-loans
+DBI::dbExecute(conn, paste(
+  "CREATE OR REPLACE TABLE", tbl_loans, "AS",
+  "WITH row_gen AS (",
+  "  SELECT",
+  "    MOD(SEQ4(), 10000) + 1 AS customer_id,",
+  "    ROW_NUMBER() OVER (ORDER BY SEQ4()) AS application_id",
+  "  FROM TABLE(GENERATOR(ROWCOUNT => 50000))",
+  "),",
+  "pay_summary AS (",
+  "  SELECT customer_id,",
+  "    AVG(days_past_due) AS avg_dpd,",
+  "    SUM(CASE WHEN payment_status = 'MISSED' THEN 1 ELSE 0 END)",
+  "      / COUNT(*) AS miss_rate",
+  "  FROM", tbl_payments,
+  "  GROUP BY customer_id",
+  "),",
+  "apps AS (",
+  "  SELECT",
+  "    r.application_id,",
+  "    r.customer_id,",
+  "    DATEADD('day', -UNIFORM(1, 730, RANDOM()),",
+  "      CURRENT_DATE()) AS application_date,",
+  "    ROUND(UNIFORM(1000, 50000, RANDOM()), -2) AS loan_amount,",
+  "    ARRAY_CONSTRUCT(12, 24, 36, 48, 60)[",
+  "      UNIFORM(0, 4, RANDOM())] :: INTEGER AS loan_term_months,",
+  "    ROUND(UNIFORM(3.5, 24.0, RANDOM())::FLOAT, 2) AS interest_rate,",
+  "    ARRAY_CONSTRUCT(",
+  "      'DEBT_CONSOLIDATION','HOME_IMPROVEMENT','BUSINESS',",
+  "      'AUTO','MEDICAL','EDUCATION','OTHER')[",
+  "      UNIFORM(0, 6, RANDOM())] :: STRING AS loan_purpose,",
+  "    CASE",
+  "      WHEN UNIFORM(0, 100, RANDOM()) <",
+  "        GREATEST(2, LEAST(60,",
+  "          35",
+  "          - c.annual_income / 10000",
+  "          - c.employment_length_years",
+  "          + COALESCE(p.avg_dpd, 5) * 0.5",
+  "          + COALESCE(p.miss_rate, 0.1) * 30",
+  "        ))",
+  "      THEN 1 ELSE 0",
+  "    END AS defaulted",
+  "  FROM row_gen r",
+  "  JOIN", tbl_customers, "c ON r.customer_id = c.customer_id",
+  "  LEFT JOIN pay_summary p ON r.customer_id = p.customer_id",
+  ")",
+  "SELECT * FROM apps"
+))
+cat(sprintf("Created %s\n", tbl_loans))
+
+DBI::dbGetQuery(conn, paste(
+  "SELECT COUNT(*) AS total_apps,",
+  "  SUM(defaulted) AS defaults,",
+  "  ROUND(AVG(defaulted) * 100, 1) AS default_rate_pct",
+  "FROM", tbl_loans
+))
+```
+
+## 5. Validation
+
+Confirm the database, schemas, and source tables are ready for the demo.
+
+```{r}
+#| label: validation
+cat("=== Setup Validation ===\n\n")
+
+cat(sprintf("Database: %s\n", cr_db))
+cat("Schemas:\n")
+for (s in c(cr_source, cr_features, cr_training, cr_registry)) {
+  cat(sprintf("  %s.%s\n", cr_db, s))
+}
+cat("\n")
+
+cat("Tables:\n")
+for (tbl in c(tbl_customers, tbl_payments, tbl_loans)) {
+  n <- DBI::dbGetQuery(conn, paste("SELECT COUNT(*) AS N FROM", tbl))
+  cat(sprintf("  %s: %s rows\n", tbl, format(n$N, big.mark = ",")))
+}
+
+cat("\nSetup complete. You can now run workspace_credit_risk_demo.qmd.\n")
+```
+
+## 6. Cleanup (Optional)
+
+Uncomment to tear down everything created by this setup document.
+
+::: {.callout-warning}
+This drops the entire database including all schemas, tables, Feature Views,
+and registered models.
+:::
+
+```{r}
+#| label: cleanup
+# DBI::dbExecute(conn, paste("DROP DATABASE IF EXISTS", cr_db))
+# cat(sprintf("Dropped database %s\n", cr_db))
+
+cat("Cleanup section -- uncomment the line above to drop everything\n")
+```
